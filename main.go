@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	godebug "runtime/debug"
 	"strconv"
-        _ "github.com/wlynxg/anet"
+
+	_ "github.com/wlynxg/anet"
+
 	"universal-bypass-tool/socks5"
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/transport/oneme"
@@ -20,30 +23,27 @@ var (
 	globalDocUrl string
 	maxToken     string
 	maxUid       string
-	localIP      string 
+	localIP      string
 )
 
 func main() {
-	//os.Setenv("GODEBUG", "netdns=go")
-        fmt.Print("written by p1neappleXpress\n")
+	fmt.Print("written by p1neappleXpress\n")
 
-	exitNode := flag.Bool("exit-node", false, "Run as exit node (needs root)")
+	exitNode := flag.Bool("exit-node", false, "Run as exit node (administrator/root privileges required)")
 	client := flag.Bool("client", false, "Run as client")
 	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	socksAddr := flag.String("socks5", ":1080", "SOCKS5 address")
-	transportType := flag.String("transport", "yandex", "Transport type (yandex, google, custom)")
-	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL. If u use Yandex.Docs transport")
-	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token. If u use MAX transport")
-	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id. If u use MAX transport")
-	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (scoped RST drop)")
+	transportType := flag.String("transport", "yandex", "Transport type (yandex, vyandex, oneme)")
+	flag.StringVar(&globalDocUrl, "url", "http://#", "Document URL for Yandex Docs transport")
+	flag.StringVar(&maxToken, "maxToken", "", "MAX Web token")
+	flag.StringVar(&maxUid, "maxUid", "", "MAX call user id")
+	flag.StringVar(&localIP, "local-ip", "", "Egress IP for exit node (Linux scoped RST drop)")
 	flag.Parse()
 
 	if localIP != "" {
 		tunnel.SetLocalIP(localIP)
 	}
 
-	// The exit node often runs on a tiny VPS; keep the heap tight under load
-	// (GC aggressively). Set GOMEMLIMIT in the environment for a hard soft-cap.
 	if *exitNode {
 		godebug.SetGCPercent(20)
 	}
@@ -83,18 +83,21 @@ func main() {
 	tun := tunnel.NewTCPTunnel(trans, *exitNode)
 
 	if *exitNode {
-		log.Printf("Running as EXIT NODE (needs root for raw socket)")
-		if localIP != "" {
-			// Scoped: only drop kernel RSTs originating from the tunnel's
-			// egress IP, leaving the host's other services (and their
-			// closed-port RSTs) untouched.
-			log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
+		if runtime.GOOS == "windows" {
+			log.Printf("Running as EXIT NODE on Windows")
+			log.Printf("Administrator privileges are required for WinDivert")
+			log.Printf("WinDivert handles the TCP packet interception/RST suppression; no iptables rule is needed")
 		} else {
-			log.Printf("! Kernel RSTs would tear down tunnel connections. Prefer a scoped rule:")
-			log.Printf("!   assign a dedicated alias IP, run with --local-ip <ip>, then:")
-			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s <ip> -j DROP")
-			log.Printf("! Host-wide fallback (drops ALL outbound RST; makes closed ports look filtered):")
-			log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+			log.Printf("Running as EXIT NODE (root/raw socket privileges required)")
+			if localIP != "" {
+				log.Printf("! Run: sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s %s -j DROP", localIP)
+			} else {
+				log.Printf("! Kernel RSTs would tear down tunnel connections. Prefer a scoped rule:")
+				log.Printf("!   assign a dedicated alias IP, run with --local-ip <ip>, then:")
+				log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -s <ip> -j DROP")
+				log.Printf("! Host-wide fallback (drops ALL outbound RST; makes closed ports look filtered):")
+				log.Printf("!   sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
+			}
 		}
 		select {}
 	} else {
