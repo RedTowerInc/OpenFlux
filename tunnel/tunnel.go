@@ -3,6 +3,7 @@ package tunnel
 import (
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +26,8 @@ type TCPTunnel struct {
 	rawEP       *RawSocketEndpoint
 	startTime   time.Time
 	packetCount atomic.Uint64
+	statsStop   chan struct{}
+	closeOnce   sync.Once
 }
 
 // TCP buffer size range for gvisor stacks. Big by default (exit node on a VPS);
@@ -53,6 +56,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		transport:  trans,
 		isExitNode: isExitNode,
 		startTime:  time.Now(),
+		statsStop:  make(chan struct{}),
 	}
 
 	utils.Debugf("[TUNNEL] Net stack init...")
@@ -61,7 +65,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 
-        SetTCPBuffers(t.gvisorStack)
+	SetTCPBuffers(t.gvisorStack)
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
@@ -189,16 +193,33 @@ func (t *TCPTunnel) printStats() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		stats := t.gvisorStack.Stats()
-		utils.Debugf("[STATS] uptime=%v packets=%d connected=%d established=%d retrans=%d",
-			time.Since(t.startTime).Round(time.Second),
-			t.packetCount.Load(),
-			stats.TCP.CurrentConnected.Value(),
-			stats.TCP.CurrentEstablished.Value(),
-			stats.TCP.Retransmits.Value(),
-		)
+	for {
+		select {
+		case <-ticker.C:
+			stats := t.gvisorStack.Stats()
+			utils.Debugf("[STATS] uptime=%v packets=%d connected=%d established=%d retrans=%d",
+				time.Since(t.startTime).Round(time.Second),
+				t.packetCount.Load(),
+				stats.TCP.CurrentConnected.Value(),
+				stats.TCP.CurrentEstablished.Value(),
+				stats.TCP.Retransmits.Value(),
+			)
+		case <-t.statsStop:
+			return
+		}
 	}
+}
+
+// Close stops the userspace TCP stack and its background stats worker.
+func (t *TCPTunnel) Close() {
+	t.closeOnce.Do(func() {
+		if t.statsStop != nil {
+			close(t.statsStop)
+		}
+		if t.gvisorStack != nil {
+			t.gvisorStack.Close()
+		}
+	})
 }
 
 // localIPOverride, when set, is the address the exit node uses as its egress
