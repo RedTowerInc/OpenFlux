@@ -1,0 +1,45 @@
+name: Android Phase 1
+
+on:
+  push:
+    branches: ["openflux-android"]
+  workflow_dispatch:
+
+jobs:
+  test-and-build-aar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager "ndk;27.0.12077973"
+
+      - name: Build OpenFlux AAR
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+          mkdir -p output/android/mobile
+          gomobile bind -target=android -androidapi 26 -o output/android/mobile/openflux.aar ./mobile
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openflux-aar
+          path: output/android/mobile/openflux.aar
+          if-no-files-found: error
