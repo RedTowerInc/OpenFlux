@@ -40,7 +40,15 @@ jobs:
           go get -tool golang.org/x/mobile/cmd/gobind@$MOBILE_VERSION
           gomobile init
           mkdir -p output/android/mobile
-          gomobile bind -target=android -androidapi 26 -o output/android/mobile/openflux.aar ./mobile
+          # github.com/wlynxg/anet intentionally uses go:linkname to patch the
+          # Android net package. Go 1.23+ requires checklinkname to be disabled
+          # for this package; this is the build mode documented by anet.
+          gomobile bind \
+            -target=android \
+            -androidapi 26 \
+            -ldflags="-checklinkname=0" \
+            -o output/android/mobile/openflux.aar \
+            ./mobile
 
       - uses: actions/upload-artifact@v4
         with:
