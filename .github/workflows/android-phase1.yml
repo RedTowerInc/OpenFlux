@@ -1,4 +1,4 @@
-name: Android Phase 1
+name: Android APK
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-and-build-aar:
+  test-build-apk:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -16,20 +16,21 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Test
+      - name: Test Go core
         run: go test ./...
 
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "17"
 
       - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
 
-      - name: Install Android NDK
-        run: sdkmanager "ndk;27.0.12077973"
+      - name: Install Android SDK and NDK
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
 
       - name: Build OpenFlux AAR
         env:
@@ -40,18 +41,29 @@ jobs:
           go get -tool golang.org/x/mobile/cmd/gobind@$MOBILE_VERSION
           gomobile init
           mkdir -p output/android/mobile
-          # github.com/wlynxg/anet intentionally uses go:linkname to patch the
-          # Android net package. Go 1.23+ requires checklinkname to be disabled
-          # for this package; this is the build mode documented by anet.
           gomobile bind \
             -target=android \
             -androidapi 26 \
             -ldflags="-checklinkname=0" \
             -o output/android/mobile/openflux.aar \
             ./mobile
+          cp output/android/mobile/openflux.aar android-app/app/libs/openflux.aar
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build debug APK
+        run: gradle -p android-app :app:assembleDebug --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
           name: openflux-aar
           path: output/android/mobile/openflux.aar
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openflux-android-debug-apk
+          path: android-app/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
