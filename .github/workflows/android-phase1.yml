@@ -19,6 +19,13 @@ jobs:
       - name: Test Go core
         run: go test ./...
 
+      - name: Build Linux exit-node
+        run: |
+          mkdir -p output/linux
+          go build -o output/linux/openflux .
+          cp scripts/install_exit_node.sh output/linux/install_exit_node.sh
+          chmod +x output/linux/openflux output/linux/install_exit_node.sh
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -66,4 +73,10 @@ jobs:
         with:
           name: openflux-android-debug-apk
           path: android-app/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openflux-linux-exit-node
+          path: output/linux/
           if-no-files-found: error
