@@ -1,0 +1,74 @@
+name: Windows Exit Node
+
+on:
+  push:
+    branches: ["openflux-android"]
+    paths:
+      - "main.go"
+      - "go.mod"
+      - "go.sum"
+      - "network/**"
+      - "transport/**"
+      - "tunnel/**"
+      - "utils/**"
+      - "windows-exit/**"
+      - ".github/workflows/windows-exit-node.yml"
+  workflow_dispatch:
+
+jobs:
+  build-windows-exit-node:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build OpenFlux Windows exit-node
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $env:CGO_ENABLED = "0"
+          go build -trimpath -ldflags="-s -w -checklinkname=0" -o dist/OpenFluxExitNode.exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add official WinDivert 2.2.2 runtime
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:TEMP "WinDivert-2.2.2-A.zip"
+          $dir = Join-Path $env:TEMP "WinDivert-2.2.2-A-extracted"
+          Invoke-WebRequest `
+            -Uri "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip" `
+            -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $dir -Force
+          Copy-Item "$dir/WinDivert-2.2.2-A/x64/WinDivert.dll" dist/WinDivert.dll
+          Copy-Item "$dir/WinDivert-2.2.2-A/x64/WinDivert64.sys" dist/WinDivert64.sys
+
+      - name: Add one-click launcher
+        shell: pwsh
+        run: |
+          Copy-Item windows-exit/START_EXIT_NODE.cmd dist/START_EXIT_NODE.cmd
+          Copy-Item windows-exit/STOP_EXIT_NODE.cmd dist/STOP_EXIT_NODE.cmd
+          Copy-Item windows-exit/config.cmd dist/config.cmd
+          Copy-Item windows-exit/README.txt dist/README.txt
+          Copy-Item LICENSE dist/LICENSE.txt
+          Copy-Item NOTICE dist/NOTICE.txt
+
+      - name: Smoke test binary
+        shell: pwsh
+        run: |
+          & ./dist/OpenFluxExitNode.exe -h 2>&1 | Out-Host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash dist/OpenFluxExitNode.exe -Algorithm SHA256 | Format-List | Out-Host
+          Get-FileHash dist/WinDivert.dll -Algorithm SHA256 | Format-List | Out-Host
+          Get-FileHash dist/WinDivert64.sys -Algorithm SHA256 | Format-List | Out-Host
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openflux-windows-exit-node
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
