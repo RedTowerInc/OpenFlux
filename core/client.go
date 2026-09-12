@@ -126,6 +126,7 @@ func (c *Client) Start() error {
 	tun := tunnel.NewTCPTunnel(trans, false)
 	socksServer := socks5.NewSOCKS5Server(c.config.SocksAddress, tun)
 	if err := socksServer.Bind(); err != nil {
+		tun.Close()
 		_ = trans.Stop()
 		c.lastError = err.Error()
 		return fmt.Errorf("bind SOCKS5: %w", err)
@@ -159,6 +160,7 @@ func (c *Client) Stop() error {
 	}
 
 	socksServer := c.socks
+	tun := c.tunnel
 	trans := c.transport
 
 	c.running = false
@@ -172,6 +174,9 @@ func (c *Client) Stop() error {
 		if err := socksServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			errs = append(errs, fmt.Errorf("stop SOCKS5: %w", err))
 		}
+	}
+	if tun != nil {
+		tun.Close()
 	}
 	if trans != nil {
 		if err := trans.Stop(); err != nil {
