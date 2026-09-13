@@ -2,7 +2,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <string>
 
@@ -15,12 +15,12 @@ Java_com_openflux_android_NativeBridge_sendFd(JNIEnv* env, jclass, jint tunFd, j
     std::string path(raw);
     env->ReleaseStringUTFChars(socketPath, raw);
 
-    if (path.empty() || path.size() >= sizeof(sockaddr_un::sun_path)) return -1;
+    sockaddr_un addr{};
+    if (path.empty() || path.size() >= sizeof(addr.sun_path)) return -1;
 
     int sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (sock < 0) return -1;
 
-    sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
 
@@ -43,6 +43,10 @@ Java_com_openflux_android_NativeBridge_sendFd(JNIEnv* env, jclass, jint tunFd, j
     msg.msg_controllen = sizeof(control);
 
     cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg == nullptr) {
+        close(sock);
+        return -1;
+    }
     cmsg->cmsg_level = SOL_SOCKET;
     cmsg->cmsg_type = SCM_RIGHTS;
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
