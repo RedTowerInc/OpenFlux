@@ -94,10 +94,9 @@ public class OpenFluxVpnService extends VpnService {
                         .setBlocking(true)
                         .addAddress("26.26.26.1", 24)
                         .addRoute("0.0.0.0", 0)
-                        // Android sends DNS into the TUN. tun2socks forwards
-                        // UDP/53 to our local DNS gateway, which converts it to
-                        // DNS-over-TCP through the OpenFlux SOCKS5 path.
-                        .addDnsServer("1.1.1.1");
+                        // Match upstream OpenFluxAndroid. badvpn intercepts any
+                        // UDP/53 packet and rewrites it toward --dnsgw.
+                        .addDnsServer("8.8.8.8");
 
                 // Critical loop prevention: OpenFlux, tun2socks and the DNS
                 // gateway all run under this app UID. Their own sockets must
@@ -118,7 +117,10 @@ public class OpenFluxVpnService extends VpnService {
 
                 tun2socks = new Tun2SocksLauncher(this);
                 if (!tun2socks.start(tun.getFd())) {
-                    throw new IllegalStateException("tun2socks failed to start or accept TUN fd");
+                    String nativeError = tun2socks.getLastError();
+                    throw new IllegalStateException(nativeError.isEmpty()
+                            ? "tun2socks failed to start or accept TUN fd"
+                            : nativeError);
                 }
 
                 running = true;
@@ -144,21 +146,26 @@ public class OpenFluxVpnService extends VpnService {
             try {
                 String raw = Mobile.statusJSON();
                 boolean t2sAlive = tun2socks != null && tun2socks.isAlive();
+                String t2sLog = tun2socks == null ? "" : tun2socks.getLastLogLine();
                 long dnsQueries = dnsProxy == null ? 0 : dnsProxy.getQueries();
                 long dnsAnswers = dnsProxy == null ? 0 : dnsProxy.getAnswers();
                 long dnsFailures = dnsProxy == null ? 0 : dnsProxy.getFailures();
+                String dnsLastFailure = dnsProxy == null ? "" : dnsProxy.getLastFailure();
 
                 getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
                         .putString("core", raw)
                         .putString("mode", "SOCKS5 + tun2socks")
                         .putBoolean("tun2socksAlive", t2sAlive)
+                        .putString("tun2socksLog", t2sLog)
                         .putLong("dnsQueries", dnsQueries)
                         .putLong("dnsAnswers", dnsAnswers)
                         .putLong("dnsFailures", dnsFailures)
+                        .putString("dnsLastFailure", dnsLastFailure)
                         .apply();
 
                 if (!t2sAlive) {
-                    stopTunnel("FAILED", "tun2socks process exited", true);
+                    String detail = tun2socks == null ? "" : tun2socks.getLastError();
+                    stopTunnel("FAILED", detail.isEmpty() ? "tun2socks process exited" : detail, true);
                     return;
                 }
 
@@ -235,9 +242,11 @@ public class OpenFluxVpnService extends VpnService {
                 .remove("udpSeen")
                 .putString("mode", "SOCKS5 + tun2socks")
                 .putBoolean("tun2socksAlive", false)
+                .putString("tun2socksLog", "")
                 .putLong("dnsQueries", 0)
                 .putLong("dnsAnswers", 0)
                 .putLong("dnsFailures", 0)
+                .putString("dnsLastFailure", "")
                 .apply();
     }
 
@@ -247,9 +256,11 @@ public class OpenFluxVpnService extends VpnService {
                 .putString("error", error == null ? "" : error)
                 .putString("mode", "SOCKS5 + tun2socks")
                 .putBoolean("tun2socksAlive", tun2socks != null && tun2socks.isAlive())
+                .putString("tun2socksLog", tun2socks == null ? "" : tun2socks.getLastLogLine())
                 .putLong("dnsQueries", dnsProxy == null ? 0 : dnsProxy.getQueries())
                 .putLong("dnsAnswers", dnsProxy == null ? 0 : dnsProxy.getAnswers())
-                .putLong("dnsFailures", dnsProxy == null ? 0 : dnsProxy.getFailures());
+                .putLong("dnsFailures", dnsProxy == null ? 0 : dnsProxy.getFailures())
+                .putString("dnsLastFailure", dnsProxy == null ? "" : dnsProxy.getLastFailure());
         if (!"RUNNING".equals(state)) e.remove("core");
         e.apply();
     }
