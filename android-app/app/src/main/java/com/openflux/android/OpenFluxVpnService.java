@@ -31,19 +31,14 @@ public class OpenFluxVpnService extends VpnService {
     private static final String CHANNEL_ID = "openflux_vpn";
     private static final int NOTIFICATION_ID = 2001;
     private static final int MTU = 1500;
-    // One ICMP reject is enough to tell a QUIC socket that UDP/443 is not
-    // available. Rate-limit globally so reject traffic can never starve TCP.
-    private static final long QUIC_REJECT_INTERVAL_NS = 100_000_000L; // 100 ms
 
     private final Object lifecycleLock = new Object();
-    private final Object tunWriteLock = new Object();
     private final AtomicLong tunInPackets = new AtomicLong();
     private final AtomicLong tunInBytes = new AtomicLong();
     private final AtomicLong tunOutPackets = new AtomicLong();
     private final AtomicLong tunOutBytes = new AtomicLong();
-    private final AtomicLong quicRejected = new AtomicLong();
+    private final AtomicLong udpSeen = new AtomicLong();
     private final AtomicLong ipv6Dropped = new AtomicLong();
-    private final AtomicLong lastQuicRejectNanos = new AtomicLong();
 
     private volatile boolean running;
     private volatile boolean starting;
@@ -95,9 +90,8 @@ public class OpenFluxVpnService extends VpnService {
                 tunInBytes.set(0);
                 tunOutPackets.set(0);
                 tunOutBytes.set(0);
-                quicRejected.set(0);
+                udpSeen.set(0);
                 ipv6Dropped.set(0);
-                lastQuicRejectNanos.set(0);
 
                 Builder builder = new Builder()
                         .setSession("OpenFlux")
@@ -105,11 +99,11 @@ public class OpenFluxVpnService extends VpnService {
                         .setBlocking(true)
                         .addAddress("10.10.10.2", 24)
                         .addRoute("0.0.0.0", 0)
-                        // PacketTunnel resolves DNS through the OpenFlux TCP path.
                         .addDnsServer("1.1.1.1")
                         .addDnsServer("8.8.8.8")
-                        // Keep IPv6 inside the VPN to avoid leaks. The current
-                        // transport is IPv4/TCP-only, so IPv6 is dropped here.
+                        // Keep IPv6 inside the VPN so it cannot leak around the
+                        // IPv4-only OpenFlux transport. We only count/drop it;
+                        // no synthetic ICMP packets are injected into the TUN.
                         .addAddress("fd00::2", 128)
                         .addRoute("::", 0);
 
@@ -161,32 +155,22 @@ public class OpenFluxVpnService extends VpnService {
                 tunInBytes.addAndGet(n);
 
                 int version = (buffer[0] >> 4) & 0x0f;
-                byte[] packet = Arrays.copyOf(buffer, n);
-
                 if (version == 6) {
-                    // Do not synthesize an ICMPv6 packet for every attempt. The
-                    // previous build did that and the resulting TUN churn could
-                    // starve normal TCP. DNS compatibility filtering already
-                    // suppresses the common AAAA/HTTPS records.
                     ipv6Dropped.incrementAndGet();
                     continue;
                 }
-
                 if (version != 4) {
                     continue;
                 }
 
-                // Only fail QUIC/HTTP3 (UDP/443), and at a low rate. All other
-                // UDP remains silently unsupported as in the last fast build.
-                byte[] quicReject = PacketRejector.rejectUnsupportedIpv4Udp(packet);
-                if (quicReject != null) {
-                    if (allowQuicReject()) {
-                        quicRejected.incrementAndGet();
-                        writeTunPacket(quicReject);
-                    }
-                    continue;
+                byte[] packet = Arrays.copyOf(buffer, n);
+                if (isNonDnsUdp(packet)) {
+                    // Diagnostic only. Do not synthesize any reply here. The Go
+                    // PacketTunnel retains the original MVP behaviour: DNS/53 is
+                    // handled, other UDP is silently unsupported, while TCP is
+                    // forwarded unchanged. This restores the known-fast baseline.
+                    udpSeen.incrementAndGet();
                 }
-
                 Mobile.writeVPNPacket(packet);
             }
             if (running) {
@@ -197,13 +181,16 @@ public class OpenFluxVpnService extends VpnService {
         }
     }
 
-    private boolean allowQuicReject() {
-        long now = System.nanoTime();
-        long prev = lastQuicRejectNanos.get();
-        if (prev != 0 && now - prev < QUIC_REJECT_INTERVAL_NS) {
-            return false;
-        }
-        return lastQuicRejectNanos.compareAndSet(prev, now);
+    private static boolean isNonDnsUdp(byte[] packet) {
+        if (packet == null || packet.length < 28) return false;
+        if (((packet[0] >>> 4) & 0x0f) != 4) return false;
+        int ihl = (packet[0] & 0x0f) * 4;
+        if (ihl < 20 || packet.length < ihl + 8) return false;
+        if ((packet[9] & 0xff) != 17) return false;
+        int fragmentOffset = ((packet[6] & 0x1f) << 8) | (packet[7] & 0xff);
+        if (fragmentOffset != 0) return false;
+        int dstPort = ((packet[ihl + 2] & 0xff) << 8) | (packet[ihl + 3] & 0xff);
+        return dstPort != 53;
     }
 
     private void pumpGoToTun() {
@@ -214,20 +201,13 @@ public class OpenFluxVpnService extends VpnService {
                     if (!running) break;
                     continue;
                 }
-                writeTunPacket(packet);
+                tunOut.write(packet);
+                tunOut.flush();
+                tunOutPackets.incrementAndGet();
+                tunOutBytes.addAndGet(packet.length);
             }
         } catch (Throwable t) {
             if (running) stopTunnel("FAILED", "TUN write: " + safeMessage(t));
-        }
-    }
-
-    private void writeTunPacket(byte[] packet) throws Exception {
-        synchronized (tunWriteLock) {
-            if (!running || tunOut == null) return;
-            tunOut.write(packet);
-            tunOut.flush();
-            tunOutPackets.incrementAndGet();
-            tunOutBytes.addAndGet(packet.length);
         }
     }
 
@@ -241,7 +221,7 @@ public class OpenFluxVpnService extends VpnService {
                         .putLong("tunInBytes", tunInBytes.get())
                         .putLong("tunOutPackets", tunOutPackets.get())
                         .putLong("tunOutBytes", tunOutBytes.get())
-                        .putLong("quicRejected", quicRejected.get())
+                        .putLong("udpSeen", udpSeen.get())
                         .putLong("ipv6Dropped", ipv6Dropped.get())
                         .apply();
                 JSONObject status = new JSONObject(raw);
@@ -291,7 +271,7 @@ public class OpenFluxVpnService extends VpnService {
                 .putLong("tunInBytes", tunInBytes.get())
                 .putLong("tunOutPackets", tunOutPackets.get())
                 .putLong("tunOutBytes", tunOutBytes.get())
-                .putLong("quicRejected", quicRejected.get())
+                .putLong("udpSeen", udpSeen.get())
                 .putLong("ipv6Dropped", ipv6Dropped.get());
         if (!"RUNNING".equals(state)) e.remove("core");
         e.apply();
