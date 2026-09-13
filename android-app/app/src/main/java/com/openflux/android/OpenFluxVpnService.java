@@ -33,10 +33,13 @@ public class OpenFluxVpnService extends VpnService {
     private static final int MTU = 1500;
 
     private final Object lifecycleLock = new Object();
+    private final Object tunWriteLock = new Object();
     private final AtomicLong tunInPackets = new AtomicLong();
     private final AtomicLong tunInBytes = new AtomicLong();
     private final AtomicLong tunOutPackets = new AtomicLong();
     private final AtomicLong tunOutBytes = new AtomicLong();
+    private final AtomicLong udpRejected = new AtomicLong();
+    private final AtomicLong ipv6Rejected = new AtomicLong();
 
     private volatile boolean running;
     private volatile boolean starting;
@@ -88,6 +91,8 @@ public class OpenFluxVpnService extends VpnService {
                 tunInBytes.set(0);
                 tunOutPackets.set(0);
                 tunOutBytes.set(0);
+                udpRejected.set(0);
+                ipv6Rejected.set(0);
 
                 Builder builder = new Builder()
                         .setSession("OpenFlux")
@@ -100,6 +105,9 @@ public class OpenFluxVpnService extends VpnService {
                         // one DNS destination; the Go layer also has TCP + DoH fallback.
                         .addDnsServer("1.1.1.1")
                         .addDnsServer("8.8.8.8")
+                        // Keep IPv6 inside the VPN so it cannot leak around OpenFlux.
+                        // Since the current tunnel is IPv4/TCP-only, pumpTunToGo returns
+                        // an immediate ICMPv6 unreachable instead of silently dropping it.
                         .addAddress("fd00::2", 128)
                         .addRoute("::", 0);
 
@@ -151,10 +159,32 @@ public class OpenFluxVpnService extends VpnService {
                 tunInBytes.addAndGet(n);
 
                 int version = (buffer[0] >> 4) & 0x0f;
+                byte[] packet = Arrays.copyOf(buffer, n);
+
+                if (version == 6) {
+                    byte[] reject = PacketRejector.rejectIpv6(packet);
+                    if (reject != null) {
+                        ipv6Rejected.incrementAndGet();
+                        writeTunPacket(reject);
+                    }
+                    continue;
+                }
+
                 if (version != 4) {
                     continue;
                 }
-                Mobile.writeVPNPacket(Arrays.copyOf(buffer, n));
+
+                // OpenFlux transport is TCP-only. A silent drop of QUIC/other UDP
+                // can make browsers and apps wait many seconds before trying TCP.
+                // Return ICMP port-unreachable immediately so they fall back now.
+                byte[] udpReject = PacketRejector.rejectUnsupportedIpv4Udp(packet);
+                if (udpReject != null) {
+                    udpRejected.incrementAndGet();
+                    writeTunPacket(udpReject);
+                    continue;
+                }
+
+                Mobile.writeVPNPacket(packet);
             }
             if (running) {
                 stopTunnel("FAILED", "TUN read pump stopped unexpectedly");
@@ -172,13 +202,20 @@ public class OpenFluxVpnService extends VpnService {
                     if (!running) break;
                     continue;
                 }
-                tunOut.write(packet);
-                tunOut.flush();
-                tunOutPackets.incrementAndGet();
-                tunOutBytes.addAndGet(packet.length);
+                writeTunPacket(packet);
             }
         } catch (Throwable t) {
             if (running) stopTunnel("FAILED", "TUN write: " + safeMessage(t));
+        }
+    }
+
+    private void writeTunPacket(byte[] packet) throws Exception {
+        synchronized (tunWriteLock) {
+            if (!running || tunOut == null) return;
+            tunOut.write(packet);
+            tunOut.flush();
+            tunOutPackets.incrementAndGet();
+            tunOutBytes.addAndGet(packet.length);
         }
     }
 
@@ -192,6 +229,8 @@ public class OpenFluxVpnService extends VpnService {
                         .putLong("tunInBytes", tunInBytes.get())
                         .putLong("tunOutPackets", tunOutPackets.get())
                         .putLong("tunOutBytes", tunOutBytes.get())
+                        .putLong("udpRejected", udpRejected.get())
+                        .putLong("ipv6Rejected", ipv6Rejected.get())
                         .apply();
                 JSONObject status = new JSONObject(raw);
                 boolean connected = status.optBoolean("connected", false);
@@ -239,7 +278,9 @@ public class OpenFluxVpnService extends VpnService {
                 .putLong("tunInPackets", tunInPackets.get())
                 .putLong("tunInBytes", tunInBytes.get())
                 .putLong("tunOutPackets", tunOutPackets.get())
-                .putLong("tunOutBytes", tunOutBytes.get());
+                .putLong("tunOutBytes", tunOutBytes.get())
+                .putLong("udpRejected", udpRejected.get())
+                .putLong("ipv6Rejected", ipv6Rejected.get());
         if (!"RUNNING".equals(state)) e.remove("core");
         e.apply();
     }
