@@ -18,13 +18,21 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Local DNS gateway for badvpn-tun2socks. Android DNS arrives as UDP, while
- * OpenFlux itself is TCP-only. Queries are therefore converted to DNS-over-TCP
- * and sent through the local OpenFlux SOCKS5 listener to a public resolver.
+ * DNS gateway for badvpn-tun2socks.
+ *
+ * badvpn's Android DNS path does not send DNS to Android loopback directly.
+ * It rewrites packets destined to UDP/53 so that they leave the TUN toward
+ * the configured --dnsgw address. The upstream OpenFluxAndroid client uses
+ * 26.26.26.1:8091 for that gateway and pdnsd listens on 0.0.0.0:8091.
+ *
+ * We keep the same TUN-side addressing, but instead of pdnsd making a direct
+ * network connection, this gateway converts DNS to DNS-over-TCP through the
+ * local OpenFlux SOCKS5 listener. This keeps DNS on the same OpenFlux path.
  */
 public final class SocksDnsProxy {
     private static final String TAG = "OpenFluxDns";
-    public static final int LISTEN_PORT = 5353;
+    public static final int LISTEN_PORT = 8091;
+    private static final String LISTEN_ADDRESS = "0.0.0.0";
     private static final String SOCKS_HOST = "127.0.0.1";
     private static final int SOCKS_PORT = 1080;
     private static final byte[][] UPSTREAMS = new byte[][]{
@@ -37,13 +45,15 @@ public final class SocksDnsProxy {
     private final AtomicLong failures = new AtomicLong();
 
     private volatile boolean running;
+    private volatile String lastFailure = "";
     private DatagramSocket socket;
     private Thread receiveThread;
     private ExecutorService workers;
 
     public synchronized void start() throws Exception {
         if (running) return;
-        socket = new DatagramSocket(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), LISTEN_PORT));
+        lastFailure = "";
+        socket = new DatagramSocket(new InetSocketAddress(InetAddress.getByName(LISTEN_ADDRESS), LISTEN_PORT));
         socket.setSoTimeout(1000);
         ThreadFactory tf = runnable -> {
             Thread t = new Thread(runnable, "openflux-dns-worker");
@@ -55,6 +65,7 @@ public final class SocksDnsProxy {
         receiveThread = new Thread(this::receiveLoop, "openflux-dns-recv");
         receiveThread.setDaemon(true);
         receiveThread.start();
+        Log.i(TAG, "DNS gateway listening on " + LISTEN_ADDRESS + ":" + LISTEN_PORT);
     }
 
     private void receiveLoop() {
@@ -70,12 +81,16 @@ public final class SocksDnsProxy {
                 workers.execute(() -> resolveAndReply(query, clientAddress, clientPort));
             } catch (SocketTimeoutException ignored) {
             } catch (Throwable t) {
-                if (running) Log.w(TAG, "DNS receive failed", t);
+                if (running) {
+                    lastFailure = "receive: " + safeMessage(t);
+                    Log.w(TAG, "DNS receive failed", t);
+                }
             }
         }
     }
 
     private void resolveAndReply(byte[] query, InetAddress clientAddress, int clientPort) {
+        String failure = "";
         for (byte[] upstream : UPSTREAMS) {
             try {
                 byte[] response = resolveViaSocks(query, upstream);
@@ -85,11 +100,14 @@ public final class SocksDnsProxy {
                     socket.send(reply);
                 }
                 answers.incrementAndGet();
+                lastFailure = "";
                 return;
             } catch (Throwable t) {
-                Log.d(TAG, "DNS upstream failed: " + t.getMessage());
+                failure = safeMessage(t);
+                Log.d(TAG, "DNS upstream failed: " + failure);
             }
         }
+        lastFailure = failure;
         failures.incrementAndGet();
     }
 
@@ -157,6 +175,11 @@ public final class SocksDnsProxy {
         in.skipBytes(2); // BND.PORT
     }
 
+    private static String safeMessage(Throwable t) {
+        String m = t.getMessage();
+        return m == null || m.isEmpty() ? t.getClass().getSimpleName() : m;
+    }
+
     public synchronized void stop() {
         running = false;
         if (socket != null) socket.close();
@@ -170,4 +193,5 @@ public final class SocksDnsProxy {
     public long getQueries() { return queries.get(); }
     public long getAnswers() { return answers.get(); }
     public long getFailures() { return failures.get(); }
+    public String getLastFailure() { return lastFailure == null ? "" : lastFailure; }
 }
