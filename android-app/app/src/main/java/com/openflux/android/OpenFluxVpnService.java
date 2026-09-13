@@ -15,13 +15,15 @@ import android.os.ParcelFileDescriptor;
 
 import org.json.JSONObject;
 
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.util.Arrays;
-import java.util.concurrent.atomic.AtomicLong;
-
 import mobile.Mobile;
 
+/**
+ * Android VPN front-end for OpenFlux.
+ *
+ * Dataplane:
+ * Android apps -> TUN -> badvpn-tun2socks -> 127.0.0.1:1080 SOCKS5 -> OpenFlux -> exit-node.
+ * DNS is converted from UDP to DNS-over-TCP and sent through the same SOCKS5/OpenFlux path.
+ */
 public class OpenFluxVpnService extends VpnService {
     public static final String ACTION_START = "com.openflux.android.action.START";
     public static final String ACTION_STOP = "com.openflux.android.action.STOP";
@@ -33,20 +35,13 @@ public class OpenFluxVpnService extends VpnService {
     private static final int MTU = 1500;
 
     private final Object lifecycleLock = new Object();
-    private final AtomicLong tunInPackets = new AtomicLong();
-    private final AtomicLong tunInBytes = new AtomicLong();
-    private final AtomicLong tunOutPackets = new AtomicLong();
-    private final AtomicLong tunOutBytes = new AtomicLong();
-    private final AtomicLong udpSeen = new AtomicLong();
-    private final AtomicLong ipv6Dropped = new AtomicLong();
 
     private volatile boolean running;
     private volatile boolean starting;
+    private volatile boolean coreStarted;
     private ParcelFileDescriptor tun;
-    private FileInputStream tunIn;
-    private FileOutputStream tunOut;
-    private Thread readThread;
-    private Thread writeThread;
+    private Tun2SocksLauncher tun2socks;
+    private SocksDnsProxy dnsProxy;
     private Thread statusThread;
 
     @Override
@@ -60,7 +55,7 @@ public class OpenFluxVpnService extends VpnService {
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
-            new Thread(() -> stopTunnel("STOPPED", ""), "openflux-stop").start();
+            new Thread(() -> stopTunnel("STOPPED", "", true), "openflux-stop").start();
             return START_NOT_STICKY;
         }
 
@@ -86,27 +81,27 @@ public class OpenFluxVpnService extends VpnService {
             try {
                 if (running) return;
 
-                tunInPackets.set(0);
-                tunInBytes.set(0);
-                tunOutPackets.set(0);
-                tunOutBytes.set(0);
-                udpSeen.set(0);
-                ipv6Dropped.set(0);
+                clearOldRuntimeCounters();
+
+                // Start the embedded OpenFlux SOCKS5 core first. Bind() is
+                // synchronous, so 127.0.0.1:1080 is ready before tun2socks.
+                Mobile.start(config);
+                coreStarted = true;
 
                 Builder builder = new Builder()
                         .setSession("OpenFlux")
                         .setMtu(MTU)
                         .setBlocking(true)
-                        .addAddress("10.10.10.2", 24)
+                        .addAddress("26.26.26.1", 24)
                         .addRoute("0.0.0.0", 0)
-                        .addDnsServer("1.1.1.1")
-                        .addDnsServer("8.8.8.8")
-                        // Keep IPv6 inside the VPN so it cannot leak around the
-                        // IPv4-only OpenFlux transport. We only count/drop it;
-                        // no synthetic ICMP packets are injected into the TUN.
-                        .addAddress("fd00::2", 128)
-                        .addRoute("::", 0);
+                        // Android sends DNS into the TUN. tun2socks forwards
+                        // UDP/53 to our local DNS gateway, which converts it to
+                        // DNS-over-TCP through the OpenFlux SOCKS5 path.
+                        .addDnsServer("1.1.1.1");
 
+                // Critical loop prevention: OpenFlux, tun2socks and the DNS
+                // gateway all run under this app UID. Their own sockets must
+                // stay outside the VPN while traffic from other apps enters it.
                 try {
                     builder.addDisallowedApplication(getPackageName());
                 } catch (PackageManager.NameNotFoundException e) {
@@ -118,161 +113,143 @@ public class OpenFluxVpnService extends VpnService {
                     throw new IllegalStateException("Android returned no VPN interface");
                 }
 
-                Mobile.startVPN(config, MTU);
+                dnsProxy = new SocksDnsProxy();
+                dnsProxy.start();
 
-                tunIn = new FileInputStream(tun.getFileDescriptor());
-                tunOut = new FileOutputStream(tun.getFileDescriptor());
+                tun2socks = new Tun2SocksLauncher(this);
+                if (!tun2socks.start(tun.getFd())) {
+                    throw new IllegalStateException("tun2socks failed to start or accept TUN fd");
+                }
+
                 running = true;
                 starting = false;
                 setRuntime("RUNNING", "");
-                updateNotification("OpenFlux VPN active");
-                startPumps();
+                updateNotification("OpenFlux VPN active (tun2socks)");
+                startStatusLoop();
             } catch (Throwable t) {
                 starting = false;
-                stopTunnel("FAILED", safeMessage(t));
+                stopTunnel("FAILED", safeMessage(t), true);
             }
         }
     }
 
-    private void startPumps() {
-        readThread = new Thread(this::pumpTunToGo, "openflux-tun-read");
-        writeThread = new Thread(this::pumpGoToTun, "openflux-tun-write");
+    private void startStatusLoop() {
         statusThread = new Thread(this::statusLoop, "openflux-status");
-        readThread.start();
-        writeThread.start();
+        statusThread.setDaemon(true);
         statusThread.start();
-    }
-
-    private void pumpTunToGo() {
-        byte[] buffer = new byte[32768];
-        try {
-            while (running) {
-                int n = tunIn.read(buffer);
-                if (n < 0) break;
-                if (n == 0) continue;
-
-                tunInPackets.incrementAndGet();
-                tunInBytes.addAndGet(n);
-
-                int version = (buffer[0] >> 4) & 0x0f;
-                if (version == 6) {
-                    ipv6Dropped.incrementAndGet();
-                    continue;
-                }
-                if (version != 4) {
-                    continue;
-                }
-
-                byte[] packet = Arrays.copyOf(buffer, n);
-                if (isNonDnsUdp(packet)) {
-                    // Diagnostic only. Do not synthesize any reply here. The Go
-                    // PacketTunnel retains the original MVP behaviour: DNS/53 is
-                    // handled, other UDP is silently unsupported, while TCP is
-                    // forwarded unchanged. This restores the known-fast baseline.
-                    udpSeen.incrementAndGet();
-                }
-                Mobile.writeVPNPacket(packet);
-            }
-            if (running) {
-                stopTunnel("FAILED", "TUN read pump stopped unexpectedly");
-            }
-        } catch (Throwable t) {
-            if (running) stopTunnel("FAILED", "TUN read: " + safeMessage(t));
-        }
-    }
-
-    private static boolean isNonDnsUdp(byte[] packet) {
-        if (packet == null || packet.length < 28) return false;
-        if (((packet[0] >>> 4) & 0x0f) != 4) return false;
-        int ihl = (packet[0] & 0x0f) * 4;
-        if (ihl < 20 || packet.length < ihl + 8) return false;
-        if ((packet[9] & 0xff) != 17) return false;
-        int fragmentOffset = ((packet[6] & 0x1f) << 8) | (packet[7] & 0xff);
-        if (fragmentOffset != 0) return false;
-        int dstPort = ((packet[ihl + 2] & 0xff) << 8) | (packet[ihl + 3] & 0xff);
-        return dstPort != 53;
-    }
-
-    private void pumpGoToTun() {
-        try {
-            while (running) {
-                byte[] packet = Mobile.readVPNPacket();
-                if (packet == null || packet.length == 0) {
-                    if (!running) break;
-                    continue;
-                }
-                tunOut.write(packet);
-                tunOut.flush();
-                tunOutPackets.incrementAndGet();
-                tunOutBytes.addAndGet(packet.length);
-            }
-        } catch (Throwable t) {
-            if (running) stopTunnel("FAILED", "TUN write: " + safeMessage(t));
-        }
     }
 
     private void statusLoop() {
         while (running) {
             try {
-                String raw = Mobile.statusVPNJSON();
+                String raw = Mobile.statusJSON();
+                boolean t2sAlive = tun2socks != null && tun2socks.isAlive();
+                long dnsQueries = dnsProxy == null ? 0 : dnsProxy.getQueries();
+                long dnsAnswers = dnsProxy == null ? 0 : dnsProxy.getAnswers();
+                long dnsFailures = dnsProxy == null ? 0 : dnsProxy.getFailures();
+
                 getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
                         .putString("core", raw)
-                        .putLong("tunInPackets", tunInPackets.get())
-                        .putLong("tunInBytes", tunInBytes.get())
-                        .putLong("tunOutPackets", tunOutPackets.get())
-                        .putLong("tunOutBytes", tunOutBytes.get())
-                        .putLong("udpSeen", udpSeen.get())
-                        .putLong("ipv6Dropped", ipv6Dropped.get())
+                        .putString("mode", "SOCKS5 + tun2socks")
+                        .putBoolean("tun2socksAlive", t2sAlive)
+                        .putLong("dnsQueries", dnsQueries)
+                        .putLong("dnsAnswers", dnsAnswers)
+                        .putLong("dnsFailures", dnsFailures)
                         .apply();
+
+                if (!t2sAlive) {
+                    stopTunnel("FAILED", "tun2socks process exited", true);
+                    return;
+                }
+
                 JSONObject status = new JSONObject(raw);
                 boolean connected = status.optBoolean("connected", false);
-                updateNotification(connected ? "OpenFlux transport connected" : "OpenFlux transport connecting...");
+                updateNotification(connected
+                        ? "OpenFlux transport connected (tun2socks)"
+                        : "OpenFlux transport connecting...");
                 Thread.sleep(1000);
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable ignored) {
-                try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    return;
+                }
             }
         }
     }
 
-    private void stopTunnel(String finalState, String error) {
+    private void stopTunnel(String finalState, String error, boolean stopService) {
         synchronized (lifecycleLock) {
-            boolean wasActive = running || starting || tun != null;
             running = false;
             starting = false;
 
-            try { Mobile.stopVPN(); } catch (Throwable ignored) {}
-            try { if (tun != null) tun.close(); } catch (Throwable ignored) {}
-            tun = null;
-            tunIn = null;
-            tunOut = null;
-
-            if (readThread != null) readThread.interrupt();
-            if (writeThread != null) writeThread.interrupt();
             if (statusThread != null) statusThread.interrupt();
-            readThread = null;
-            writeThread = null;
             statusThread = null;
 
-            setRuntime(finalState, error == null ? "" : error);
-            if (wasActive) {
-                stopForeground(STOP_FOREGROUND_REMOVE);
+            try {
+                if (tun2socks != null) tun2socks.stop();
+            } catch (Throwable ignored) {
             }
-            stopSelf();
+            tun2socks = null;
+
+            try {
+                if (dnsProxy != null) dnsProxy.stop();
+            } catch (Throwable ignored) {
+            }
+            dnsProxy = null;
+
+            try {
+                if (tun != null) tun.close();
+            } catch (Throwable ignored) {
+            }
+            tun = null;
+
+            if (coreStarted) {
+                try {
+                    Mobile.stop();
+                } catch (Throwable ignored) {
+                }
+                coreStarted = false;
+            }
+
+            setRuntime(finalState, error == null ? "" : error);
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+            } catch (Throwable ignored) {
+            }
+            if (stopService) stopSelf();
         }
+    }
+
+    private void clearOldRuntimeCounters() {
+        getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
+                .remove("core")
+                .remove("tunInPackets")
+                .remove("tunInBytes")
+                .remove("tunOutPackets")
+                .remove("tunOutBytes")
+                .remove("quicRejected")
+                .remove("ipv6Dropped")
+                .remove("udpSeen")
+                .putString("mode", "SOCKS5 + tun2socks")
+                .putBoolean("tun2socksAlive", false)
+                .putLong("dnsQueries", 0)
+                .putLong("dnsAnswers", 0)
+                .putLong("dnsFailures", 0)
+                .apply();
     }
 
     private void setRuntime(String state, String error) {
         SharedPreferences.Editor e = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
                 .putString("state", state)
                 .putString("error", error == null ? "" : error)
-                .putLong("tunInPackets", tunInPackets.get())
-                .putLong("tunInBytes", tunInBytes.get())
-                .putLong("tunOutPackets", tunOutPackets.get())
-                .putLong("tunOutBytes", tunOutBytes.get())
-                .putLong("udpSeen", udpSeen.get())
-                .putLong("ipv6Dropped", ipv6Dropped.get());
+                .putString("mode", "SOCKS5 + tun2socks")
+                .putBoolean("tun2socksAlive", tun2socks != null && tun2socks.isAlive())
+                .putLong("dnsQueries", dnsProxy == null ? 0 : dnsProxy.getQueries())
+                .putLong("dnsAnswers", dnsProxy == null ? 0 : dnsProxy.getAnswers())
+                .putLong("dnsFailures", dnsProxy == null ? 0 : dnsProxy.getFailures());
         if (!"RUNNING".equals(state)) e.remove("core");
         e.apply();
     }
@@ -324,7 +301,16 @@ public class OpenFluxVpnService extends VpnService {
     }
 
     @Override
+    public void onRevoke() {
+        stopTunnel("STOPPED", "VPN permission revoked", true);
+        super.onRevoke();
+    }
+
+    @Override
     public void onDestroy() {
+        if (running || starting || coreStarted || tun != null) {
+            stopTunnel("STOPPED", "", false);
+        }
         super.onDestroy();
     }
 
