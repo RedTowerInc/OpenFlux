@@ -11,27 +11,38 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Starts the same badvpn-tun2socks runtime used by the upstream Android client,
- * but points it at the SOCKS5 listener exposed by the embedded OpenFlux core.
+ * Starts badvpn-tun2socks and points it at the SOCKS5 listener exposed by the
+ * embedded OpenFlux core.
+ *
+ * Important: do NOT pass --pid here. The Android badvpn build daemonizes when
+ * --pid is supplied. In that mode ProcessBuilder observes the short-lived
+ * parent process and incorrectly concludes that tun2socks died before the TUN
+ * fd handoff. Keeping tun2socks in the foreground gives us a real Process
+ * handle and deterministic lifecycle management.
  */
 public final class Tun2SocksLauncher {
     private static final String TAG = "OpenFluxTun2Socks";
-    private static final int SEND_FD_ATTEMPTS = 20;
-    private static final long SEND_FD_DELAY_MS = 150L;
+    private static final int SEND_FD_ATTEMPTS = 30;
+    private static final long SEND_FD_DELAY_MS = 100L;
 
     private final Context context;
     private Process process;
     private File socketFile;
-    private File pidFile;
     private Thread logThread;
+    private volatile String lastLogLine = "";
+    private volatile String lastError = "";
 
     public Tun2SocksLauncher(Context context) {
         this.context = context.getApplicationContext();
     }
 
     public synchronized boolean start(int tunFd) {
+        lastError = "";
+        lastLogLine = "";
+
         if (tunFd <= 0) {
-            Log.e(TAG, "Invalid TUN fd: " + tunFd);
+            lastError = "invalid TUN fd: " + tunFd;
+            Log.e(TAG, lastError);
             return false;
         }
         if (process != null && process.isAlive()) return true;
@@ -40,17 +51,22 @@ public final class Tun2SocksLauncher {
             File nativeDir = new File(context.getApplicationInfo().nativeLibraryDir);
             File binary = new File(nativeDir, "libtun2socks.so");
             if (!binary.exists()) {
-                Log.e(TAG, "Missing tun2socks runtime: " + binary);
+                lastError = "missing tun2socks runtime: " + binary;
+                Log.e(TAG, lastError);
+                return false;
+            }
+            if (!binary.canExecute()) {
+                lastError = "tun2socks runtime is not executable: " + binary;
+                Log.e(TAG, lastError);
                 return false;
             }
 
             socketFile = new File(context.getApplicationInfo().dataDir, "openflux_tun2socks.sock");
-            pidFile = new File(context.getFilesDir(), "openflux_tun2socks.pid");
-            // The upstream launcher creates the path before starting badvpn;
-            // badvpn replaces/uses it as its fd-passing UNIX socket.
-            if (socketFile.exists()) socketFile.delete();
-            socketFile.createNewFile();
-            if (pidFile.exists()) pidFile.delete();
+            if (socketFile.exists() && !socketFile.delete()) {
+                lastError = "could not remove stale tun2socks socket: " + socketFile;
+                Log.e(TAG, lastError);
+                return false;
+            }
 
             List<String> command = new ArrayList<>();
             command.add(binary.getAbsolutePath());
@@ -60,7 +76,6 @@ public final class Tun2SocksLauncher {
             command.add("--tunfd"); command.add(Integer.toString(tunFd));
             command.add("--tunmtu"); command.add("1500");
             command.add("--loglevel"); command.add("3");
-            command.add("--pid"); command.add(pidFile.getAbsolutePath());
             command.add("--sock"); command.add(socketFile.getAbsolutePath());
             command.add("--dnsgw"); command.add("127.0.0.1:5353");
 
@@ -71,25 +86,51 @@ public final class Tun2SocksLauncher {
             process = pb.start();
             startLogDrain(process);
 
+            // The native process creates and listens on the UNIX socket before
+            // waiting for SCM_RIGHTS. Retry until that socket is ready.
             for (int attempt = 1; attempt <= SEND_FD_ATTEMPTS; attempt++) {
-                if (!process.isAlive()) {
-                    Log.e(TAG, "tun2socks exited before fd handoff");
+                Process p = process;
+                if (p == null || !p.isAlive()) {
+                    int exitCode = safeExitCode(p);
+                    lastError = "tun2socks exited before TUN fd handoff"
+                            + (exitCode == Integer.MIN_VALUE ? "" : " (exit=" + exitCode + ")")
+                            + logSuffix();
+                    Log.e(TAG, lastError);
                     stop();
                     return false;
                 }
-                int result = NativeBridge.sendFd(tunFd, socketFile.getAbsolutePath());
-                if (result == 0) {
-                    Log.i(TAG, "TUN fd handed to tun2socks on attempt " + attempt);
-                    return true;
+
+                if (socketFile.exists()) {
+                    int result = NativeBridge.sendFd(tunFd, socketFile.getAbsolutePath());
+                    if (result == 0) {
+                        // Give badvpn a moment to consume the fd and enter its
+                        // event loop. If it exits immediately, expose that as a
+                        // startup failure instead of reporting RUNNING.
+                        Thread.sleep(80L);
+                        if (!p.isAlive()) {
+                            int exitCode = safeExitCode(p);
+                            lastError = "tun2socks exited after TUN fd handoff"
+                                    + (exitCode == Integer.MIN_VALUE ? "" : " (exit=" + exitCode + ")")
+                                    + logSuffix();
+                            Log.e(TAG, lastError);
+                            stop();
+                            return false;
+                        }
+                        Log.i(TAG, "TUN fd handed to tun2socks on attempt " + attempt);
+                        return true;
+                    }
                 }
-                Thread.sleep(SEND_FD_DELAY_MS * Math.min(attempt, 5));
+
+                Thread.sleep(SEND_FD_DELAY_MS * Math.min(attempt, 6));
             }
 
-            Log.e(TAG, "Failed to hand TUN fd to tun2socks");
+            lastError = "timed out waiting for tun2socks TUN fd socket" + logSuffix();
+            Log.e(TAG, lastError);
             stop();
             return false;
         } catch (Throwable t) {
-            Log.e(TAG, "Failed to start tun2socks", t);
+            lastError = "failed to start tun2socks: " + safeMessage(t) + logSuffix();
+            Log.e(TAG, lastError, t);
             stop();
             return false;
         }
@@ -100,7 +141,11 @@ public final class Tun2SocksLauncher {
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
-                    if (!line.trim().isEmpty()) Log.d(TAG, line);
+                    String trimmed = line.trim();
+                    if (!trimmed.isEmpty()) {
+                        lastLogLine = trimmed;
+                        Log.d(TAG, trimmed);
+                    }
                 }
             } catch (Throwable ignored) {
             }
@@ -109,8 +154,31 @@ public final class Tun2SocksLauncher {
         logThread.start();
     }
 
+    private String logSuffix() {
+        String line = lastLogLine;
+        return line == null || line.isEmpty() ? "" : "; native: " + line;
+    }
+
+    private static int safeExitCode(Process p) {
+        if (p == null) return Integer.MIN_VALUE;
+        try {
+            return p.exitValue();
+        } catch (IllegalThreadStateException e) {
+            return Integer.MIN_VALUE;
+        }
+    }
+
+    private static String safeMessage(Throwable t) {
+        String m = t.getMessage();
+        return m == null || m.isEmpty() ? t.getClass().getSimpleName() : m;
+    }
+
     public synchronized boolean isAlive() {
         return process != null && process.isAlive();
+    }
+
+    public String getLastError() {
+        return lastError == null ? "" : lastError;
     }
 
     public synchronized void stop() {
@@ -130,8 +198,6 @@ public final class Tun2SocksLauncher {
         if (logThread != null) logThread.interrupt();
         logThread = null;
         if (socketFile != null) socketFile.delete();
-        if (pidFile != null) pidFile.delete();
         socketFile = null;
-        pidFile = null;
     }
 }
