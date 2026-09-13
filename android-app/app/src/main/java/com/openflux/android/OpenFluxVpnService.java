@@ -18,6 +18,7 @@ import org.json.JSONObject;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 
 import mobile.Mobile;
 
@@ -32,6 +33,11 @@ public class OpenFluxVpnService extends VpnService {
     private static final int MTU = 1500;
 
     private final Object lifecycleLock = new Object();
+    private final AtomicLong tunInPackets = new AtomicLong();
+    private final AtomicLong tunInBytes = new AtomicLong();
+    private final AtomicLong tunOutPackets = new AtomicLong();
+    private final AtomicLong tunOutBytes = new AtomicLong();
+
     private volatile boolean running;
     private volatile boolean starting;
     private ParcelFileDescriptor tun;
@@ -78,9 +84,19 @@ public class OpenFluxVpnService extends VpnService {
             try {
                 if (running) return;
 
+                tunInPackets.set(0);
+                tunInBytes.set(0);
+                tunOutPackets.set(0);
+                tunOutBytes.set(0);
+
                 Builder builder = new Builder()
                         .setSession("OpenFlux")
                         .setMtu(MTU)
+                        // VpnService.establish() returns a non-blocking fd by default.
+                        // FileInputStream/FileOutputStream pumps are blocking-style code,
+                        // so explicitly request blocking mode. Without this the read pump
+                        // can exit immediately with no packets while the UI still says RUNNING.
+                        .setBlocking(true)
                         .addAddress("10.10.10.2", 24)
                         .addRoute("0.0.0.0", 0)
                         .addDnsServer("1.1.1.1")
@@ -128,12 +144,20 @@ public class OpenFluxVpnService extends VpnService {
         try {
             while (running) {
                 int n = tunIn.read(buffer);
-                if (n <= 0) break;
+                if (n < 0) break;
+                if (n == 0) continue;
+
+                tunInPackets.incrementAndGet();
+                tunInBytes.addAndGet(n);
+
                 int version = (buffer[0] >> 4) & 0x0f;
                 if (version != 4) {
                     continue;
                 }
                 Mobile.writeVPNPacket(Arrays.copyOf(buffer, n));
+            }
+            if (running) {
+                stopTunnel("FAILED", "TUN read pump stopped unexpectedly");
             }
         } catch (Throwable t) {
             if (running) stopTunnel("FAILED", "TUN read: " + safeMessage(t));
@@ -149,6 +173,9 @@ public class OpenFluxVpnService extends VpnService {
                     continue;
                 }
                 tunOut.write(packet);
+                tunOut.flush();
+                tunOutPackets.incrementAndGet();
+                tunOutBytes.addAndGet(packet.length);
             }
         } catch (Throwable t) {
             if (running) stopTunnel("FAILED", "TUN write: " + safeMessage(t));
@@ -161,15 +188,19 @@ public class OpenFluxVpnService extends VpnService {
                 String raw = Mobile.statusVPNJSON();
                 getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
                         .putString("core", raw)
+                        .putLong("tunInPackets", tunInPackets.get())
+                        .putLong("tunInBytes", tunInBytes.get())
+                        .putLong("tunOutPackets", tunOutPackets.get())
+                        .putLong("tunOutBytes", tunOutBytes.get())
                         .apply();
                 JSONObject status = new JSONObject(raw);
                 boolean connected = status.optBoolean("connected", false);
                 updateNotification(connected ? "OpenFlux transport connected" : "OpenFlux transport connecting...");
-                Thread.sleep(1500);
+                Thread.sleep(1000);
             } catch (InterruptedException e) {
                 return;
             } catch (Throwable ignored) {
-                try { Thread.sleep(1500); } catch (InterruptedException e) { return; }
+                try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
             }
         }
     }
@@ -204,7 +235,11 @@ public class OpenFluxVpnService extends VpnService {
     private void setRuntime(String state, String error) {
         SharedPreferences.Editor e = getSharedPreferences(RUNTIME_PREFS, MODE_PRIVATE).edit()
                 .putString("state", state)
-                .putString("error", error == null ? "" : error);
+                .putString("error", error == null ? "" : error)
+                .putLong("tunInPackets", tunInPackets.get())
+                .putLong("tunInBytes", tunInBytes.get())
+                .putLong("tunOutPackets", tunOutPackets.get())
+                .putLong("tunOutBytes", tunOutBytes.get());
         if (!"RUNNING".equals(state)) e.remove("core");
         e.apply();
     }
