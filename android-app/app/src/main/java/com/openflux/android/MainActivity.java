@@ -156,7 +156,9 @@ public class MainActivity extends Activity {
             cfg.put("maxToken", token);
             cfg.put("maxUid", uid);
             cfg.put("socksAddress", "127.0.0.1:1080");
-            cfg.put("debug", true);
+            // Per-packet debug logging is intentionally disabled in normal VPN
+            // operation. Diagnostics are exposed through counters below instead.
+            cfg.put("debug", false);
             pendingConfig = cfg.toString();
             saveConfig();
 
@@ -230,7 +232,7 @@ public class MainActivity extends Activity {
                 out.append("  (")
                         .append(formatBytes(runtime.getLong("tunInBytes", 0))).append(" / ")
                         .append(formatBytes(runtime.getLong("tunOutBytes", 0))).append(")");
-                out.append("\nQUIC rejects: ").append(runtime.getLong("quicRejected", 0));
+                out.append("\nUDP non-DNS seen: ").append(runtime.getLong("udpSeen", 0));
                 out.append("  IPv6 drops: ").append(runtime.getLong("ipv6Dropped", 0));
                 out.append("\nReconnects: ").append(s.optLong("reconnects", 0));
                 String last = s.optString("lastError", "");
@@ -269,7 +271,7 @@ public class MainActivity extends Activity {
             cfg.put("maxToken", maxToken.getText().toString().trim());
             cfg.put("maxUid", maxUid.getText().toString().trim());
             cfg.put("socksAddress", "127.0.0.1:1080");
-            cfg.put("debug", true);
+            cfg.put("debug", false);
             return cfg.toString();
         } catch (Exception e) {
             return "{}";
