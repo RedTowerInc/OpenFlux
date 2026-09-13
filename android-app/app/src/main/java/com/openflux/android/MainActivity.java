@@ -230,6 +230,22 @@ public class MainActivity extends Activity {
                         .append(runtime.getLong("dnsFailures", 0));
                 String dnsLast = runtime.getString("dnsLastFailure", "");
                 if (!dnsLast.isEmpty()) out.append("\nDNS last: ").append(dnsLast);
+
+                out.append("\nSOCKS A/C/OK/F/H: ")
+                        .append(s.optLong("socksAccepted", 0)).append(" / ")
+                        .append(s.optLong("socksConnectRequests", 0)).append(" / ")
+                        .append(s.optLong("socksDialSuccess", 0)).append(" / ")
+                        .append(s.optLong("socksDialFailures", 0)).append(" / ")
+                        .append(s.optLong("socksHandshakeErrors", 0));
+                out.append("\nSOCKS active: ").append(s.optLong("socksActive", 0));
+                out.append("  U/D: ")
+                        .append(formatBytes(s.optLong("socksBytesUp", 0))).append(" / ")
+                        .append(formatBytes(s.optLong("socksBytesDown", 0)));
+                String socksTarget = s.optString("socksLastTarget", "");
+                if (!socksTarget.isEmpty()) out.append("\nSOCKS target: ").append(socksTarget);
+                String socksError = s.optString("socksLastError", "");
+                if (!socksError.isEmpty()) out.append("\nSOCKS error: ").append(socksError);
+
                 out.append("\nReconnects: ").append(s.optLong("reconnects", 0));
                 String last = s.optString("lastError", "");
                 if (!last.isEmpty()) out.append("\nCore: ").append(last);
