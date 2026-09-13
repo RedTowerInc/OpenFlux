@@ -35,9 +35,9 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Install Android SDK and NDK
+      - name: Install Android SDK, NDK and CMake
         run: |
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973"
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.0.12077973" "cmake;3.22.1"
 
       - name: Build OpenFlux AAR
         env:
@@ -55,6 +55,18 @@ jobs:
             -o output/android/mobile/openflux.aar \
             ./mobile
           cp output/android/mobile/openflux.aar android-app/app/libs/openflux.aar
+
+      - name: Install pinned upstream tun2socks runtime
+        run: |
+          set -euxo pipefail
+          RUNTIME_COMMIT=3f0eeac022ace5137fac0f5fab54c81b409d8fe0
+          DEST=android-app/app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$DEST"
+          curl --fail --location --retry 3 \
+            "https://raw.githubusercontent.com/p1neappleXpress/OpenFluxAndroid/${RUNTIME_COMMIT}/app/src/main/jniLibs/arm64-v8a/libtun2socks.so" \
+            -o "$DEST/libtun2socks.so"
+          test "$(stat -c%s "$DEST/libtun2socks.so")" = "155456"
+          chmod 755 "$DEST/libtun2socks.so"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
