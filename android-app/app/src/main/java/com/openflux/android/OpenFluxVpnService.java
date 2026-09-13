@@ -92,14 +92,14 @@ public class OpenFluxVpnService extends VpnService {
                 Builder builder = new Builder()
                         .setSession("OpenFlux")
                         .setMtu(MTU)
-                        // VpnService.establish() returns a non-blocking fd by default.
-                        // FileInputStream/FileOutputStream pumps are blocking-style code,
-                        // so explicitly request blocking mode. Without this the read pump
-                        // can exit immediately with no packets while the UI still says RUNNING.
                         .setBlocking(true)
                         .addAddress("10.10.10.2", 24)
                         .addRoute("0.0.0.0", 0)
+                        // PacketTunnel resolves DNS through the OpenFlux TCP path.
+                        // Giving Android two resolver IPs avoids pinning all clients to
+                        // one DNS destination; the Go layer also has TCP + DoH fallback.
                         .addDnsServer("1.1.1.1")
+                        .addDnsServer("8.8.8.8")
                         .addAddress("fd00::2", 128)
                         .addRoute("::", 0);
 
