@@ -71,7 +71,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("TCP VPN MVP. Нужен запущенный exit-node с тем же транспортом. UDP/QUIC пока не поддерживаются.");
+        subtitle.setText("SOCKS5 + tun2socks VPN. DNS идёт через OpenFlux. Остальной UDP/QUIC пока не поддерживается и должен откатываться на TCP.");
         subtitle.setTextSize(14);
         subtitle.setPadding(0, dp(6), 0, dp(18));
         root.addView(subtitle);
@@ -156,8 +156,6 @@ public class MainActivity extends Activity {
             cfg.put("maxToken", token);
             cfg.put("maxUid", uid);
             cfg.put("socksAddress", "127.0.0.1:1080");
-            // Per-packet debug logging is intentionally disabled in normal VPN
-            // operation. Diagnostics are exposed through counters below instead.
             cfg.put("debug", false);
             pendingConfig = cfg.toString();
             saveConfig();
@@ -186,9 +184,7 @@ public class MainActivity extends Activity {
     }
 
     private void startVpnService() {
-        if (pendingConfig == null) {
-            pendingConfig = buildSavedConfig();
-        }
+        if (pendingConfig == null) pendingConfig = buildSavedConfig();
         Intent intent = new Intent(this, OpenFluxVpnService.class);
         intent.setAction(OpenFluxVpnService.ACTION_START);
         intent.putExtra(OpenFluxVpnService.EXTRA_CONFIG, pendingConfig);
@@ -211,13 +207,13 @@ public class MainActivity extends Activity {
 
         StringBuilder out = new StringBuilder();
         out.append("State: ").append(state);
-        if (!error.isEmpty()) {
-            out.append("\nError: ").append(error);
-        }
+        if (!error.isEmpty()) out.append("\nError: ").append(error);
 
         if (active) {
+            out.append("\nMode: ").append(runtime.getString("mode", "SOCKS5 + tun2socks"));
+            out.append("\ntun2socks: ").append(runtime.getBoolean("tun2socksAlive", false) ? "alive" : "not ready");
             try {
-                JSONObject s = new JSONObject(Mobile.statusVPNJSON());
+                JSONObject s = new JSONObject(Mobile.statusJSON());
                 out.append("\nTransport: ").append(s.optString("transport", "-"));
                 out.append("\nConnected: ").append(s.optBoolean("connected", false));
                 out.append("\nUptime: ").append(s.optLong("uptimeSeconds", 0)).append(" s");
@@ -226,14 +222,10 @@ public class MainActivity extends Activity {
                 out.append("\nPackets RX/TX: ")
                         .append(s.optLong("packetsReceived", 0)).append(" / ")
                         .append(s.optLong("packetsSent", 0));
-                out.append("\nTUN IN/OUT: ")
-                        .append(runtime.getLong("tunInPackets", 0)).append(" / ")
-                        .append(runtime.getLong("tunOutPackets", 0));
-                out.append("  (")
-                        .append(formatBytes(runtime.getLong("tunInBytes", 0))).append(" / ")
-                        .append(formatBytes(runtime.getLong("tunOutBytes", 0))).append(")");
-                out.append("\nUDP non-DNS seen: ").append(runtime.getLong("udpSeen", 0));
-                out.append("  IPv6 drops: ").append(runtime.getLong("ipv6Dropped", 0));
+                out.append("\nDNS Q/A/F: ")
+                        .append(runtime.getLong("dnsQueries", 0)).append(" / ")
+                        .append(runtime.getLong("dnsAnswers", 0)).append(" / ")
+                        .append(runtime.getLong("dnsFailures", 0));
                 out.append("\nReconnects: ").append(s.optLong("reconnects", 0));
                 String last = s.optString("lastError", "");
                 if (!last.isEmpty()) out.append("\nCore: ").append(last);
