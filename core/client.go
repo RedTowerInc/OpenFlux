@@ -40,6 +40,17 @@ type Status struct {
 	Reconnects    uint64 `json:"reconnects"`
 	UptimeSeconds int64  `json:"uptimeSeconds"`
 	LastError     string `json:"lastError,omitempty"`
+
+	SocksAccepted        uint64 `json:"socksAccepted"`
+	SocksConnectRequests uint64 `json:"socksConnectRequests"`
+	SocksDialSuccess     uint64 `json:"socksDialSuccess"`
+	SocksDialFailures    uint64 `json:"socksDialFailures"`
+	SocksHandshakeErrors uint64 `json:"socksHandshakeErrors"`
+	SocksActive          int64  `json:"socksActive"`
+	SocksBytesUp         uint64 `json:"socksBytesUp"`
+	SocksBytesDown       uint64 `json:"socksBytesDown"`
+	SocksLastTarget      string `json:"socksLastTarget,omitempty"`
+	SocksLastError       string `json:"socksLastError,omitempty"`
 }
 
 type Client struct {
@@ -215,6 +226,19 @@ func (c *Client) Status() Status {
 		status.PacketsSent = stats.PacketsSent
 		status.PacketsRecv = stats.PacketsRecv
 		status.Reconnects = stats.Reconnects
+	}
+	if c.socks != nil {
+		s := c.socks.Stats()
+		status.SocksAccepted = s.Accepted
+		status.SocksConnectRequests = s.ConnectRequests
+		status.SocksDialSuccess = s.DialSuccess
+		status.SocksDialFailures = s.DialFailures
+		status.SocksHandshakeErrors = s.HandshakeErrors
+		status.SocksActive = s.Active
+		status.SocksBytesUp = s.BytesUp
+		status.SocksBytesDown = s.BytesDown
+		status.SocksLastTarget = s.LastTarget
+		status.SocksLastError = s.LastError
 	}
 	return status
 }
