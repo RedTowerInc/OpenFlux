@@ -221,6 +221,17 @@ public class MainActivity extends Activity {
                 out.append("\nUptime: ").append(s.optLong("uptimeSeconds", 0)).append(" s");
                 out.append("\nRX: ").append(formatBytes(s.optLong("bytesReceived", 0)));
                 out.append("  TX: ").append(formatBytes(s.optLong("bytesSent", 0)));
+                out.append("\nPackets RX/TX: ")
+                        .append(s.optLong("packetsReceived", 0)).append(" / ")
+                        .append(s.optLong("packetsSent", 0));
+                out.append("\nTUN IN/OUT: ")
+                        .append(runtime.getLong("tunInPackets", 0)).append(" / ")
+                        .append(runtime.getLong("tunOutPackets", 0));
+                out.append("  (")
+                        .append(formatBytes(runtime.getLong("tunInBytes", 0))).append(" / ")
+                        .append(formatBytes(runtime.getLong("tunOutBytes", 0))).append(")");
+                out.append("\nQUIC rejects: ").append(runtime.getLong("quicRejected", 0));
+                out.append("  IPv6 drops: ").append(runtime.getLong("ipv6Dropped", 0));
                 out.append("\nReconnects: ").append(s.optLong("reconnects", 0));
                 String last = s.optString("lastError", "");
                 if (!last.isEmpty()) out.append("\nCore: ").append(last);
