@@ -77,7 +77,11 @@ public final class Tun2SocksLauncher {
             command.add("--tunmtu"); command.add("1500");
             command.add("--loglevel"); command.add("3");
             command.add("--sock"); command.add(socketFile.getAbsolutePath());
-            command.add("--dnsgw"); command.add("127.0.0.1:5353");
+            // This address is not an ordinary host-side UDP destination.
+            // badvpn rewrites DNS packets and writes them back through the TUN.
+            // Match upstream OpenFluxAndroid exactly: the Android side owns
+            // 26.26.26.1 and the DNS gateway listens on UDP/8091 there.
+            command.add("--dnsgw"); command.add("26.26.26.1:8091");
 
             ProcessBuilder pb = new ProcessBuilder(command);
             pb.directory(context.getFilesDir());
@@ -103,9 +107,6 @@ public final class Tun2SocksLauncher {
                 if (socketFile.exists()) {
                     int result = NativeBridge.sendFd(tunFd, socketFile.getAbsolutePath());
                     if (result == 0) {
-                        // Give badvpn a moment to consume the fd and enter its
-                        // event loop. If it exits immediately, expose that as a
-                        // startup failure instead of reporting RUNNING.
                         Thread.sleep(80L);
                         if (!p.isAlive()) {
                             int exitCode = safeExitCode(p);
@@ -179,6 +180,10 @@ public final class Tun2SocksLauncher {
 
     public String getLastError() {
         return lastError == null ? "" : lastError;
+    }
+
+    public String getLastLogLine() {
+        return lastLogLine == null ? "" : lastLogLine;
     }
 
     public synchronized void stop() {
