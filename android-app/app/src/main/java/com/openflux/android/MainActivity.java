@@ -212,6 +212,8 @@ public class MainActivity extends Activity {
         if (active) {
             out.append("\nMode: ").append(runtime.getString("mode", "SOCKS5 + tun2socks"));
             out.append("\ntun2socks: ").append(runtime.getBoolean("tun2socksAlive", false) ? "alive" : "not ready");
+            String t2sLog = runtime.getString("tun2socksLog", "");
+            if (!t2sLog.isEmpty()) out.append("\ntun2socks log: ").append(t2sLog);
             try {
                 JSONObject s = new JSONObject(Mobile.statusJSON());
                 out.append("\nTransport: ").append(s.optString("transport", "-"));
@@ -226,6 +228,8 @@ public class MainActivity extends Activity {
                         .append(runtime.getLong("dnsQueries", 0)).append(" / ")
                         .append(runtime.getLong("dnsAnswers", 0)).append(" / ")
                         .append(runtime.getLong("dnsFailures", 0));
+                String dnsLast = runtime.getString("dnsLastFailure", "");
+                if (!dnsLast.isEmpty()) out.append("\nDNS last: ").append(dnsLast);
                 out.append("\nReconnects: ").append(s.optLong("reconnects", 0));
                 String last = s.optString("lastError", "");
                 if (!last.isEmpty()) out.append("\nCore: ").append(last);
