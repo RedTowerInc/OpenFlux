@@ -2,6 +2,7 @@ package yandex
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +21,15 @@ import (
 	"universal-bypass-tool/utils"
 )
 
+const (
+	yandexBatchMaxPackets = 8
+	yandexWriteTimeout     = 10 * time.Second
+)
+
+var yandexBatchMagic = [5]byte{0xf7, 'O', 'F', 'B', 0x01}
+
+const yandexBatchCapability = "---OFB1---"
+
 type YandexDocsInfo struct {
 	CookieStr   string
 	Token       string
@@ -34,27 +44,35 @@ type YandexDocsInfo struct {
 }
 
 type DocSession struct {
-	Info       YandexDocsInfo
-	Conn       *websocket.Conn
-	WriteQueue chan []byte
-	UserID     string
-	writeMu    sync.Mutex
+	Info          YandexDocsInfo
+	Conn          *websocket.Conn
+	WriteQueue    chan []byte
+	PriorityQueue chan []byte
+	UserID        string
+	writeMu       sync.Mutex
 }
 
 func (s *DocSession) safeWrite(messageType int, data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return s.Conn.WriteMessage(messageType, data)
+	if s.Conn == nil {
+		return fmt.Errorf("nil websocket")
+	}
+	_ = s.Conn.SetWriteDeadline(time.Now().Add(yandexWriteTimeout))
+	err := s.Conn.WriteMessage(messageType, data)
+	_ = s.Conn.SetWriteDeadline(time.Time{})
+	return err
 }
 
 type YandexDocsTransport struct {
 	*transport.BaseTransport
 
-	url      string
-	session  *DocSession
+	url     string
+	session *DocSession
 
 	userCounter atomic.Int32
 	baseUserID  string
+	peerBatch   atomic.Int32
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
@@ -72,6 +90,7 @@ func (t *YandexDocsTransport) Start() error {
 	}
 
 	t.baseUserID = randUserID()
+	t.peerBatch.Store(0)
 	utils.SafeGo("yandex.keepAlive", t.keepAliveLoop)
 	t.connectToDoc(0)
 
@@ -79,6 +98,13 @@ func (t *YandexDocsTransport) Start() error {
 }
 
 func (t *YandexDocsTransport) Send(data []byte) error {
+	return t.SendPriority(data, false)
+}
+
+// SendPriority is used by CompressedTransport when the original IP packet is
+// latency-sensitive. Small TCP control/request packets bypass queued bulk data,
+// which prevents one large transfer from stalling DNS/TLS/HTTP setup flows.
+func (t *YandexDocsTransport) SendPriority(data []byte, priority bool) error {
 	if !t.IsConnected() {
 		return fmt.Errorf("transport not connected")
 	}
@@ -89,6 +115,24 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 
 	if session == nil {
 		return fmt.Errorf("no active session")
+	}
+
+	if priority && session.PriorityQueue != nil {
+		select {
+		case session.PriorityQueue <- data:
+			t.RecordSend(len(data))
+			return nil
+		default:
+			// If the priority queue bursts, spill into the normal queue instead
+			// of dropping a SYN/ACK/DNS/TLS packet immediately.
+			select {
+			case session.WriteQueue <- data:
+				t.RecordSend(len(data))
+				return nil
+			default:
+				return fmt.Errorf("yandex write queues full")
+			}
+		}
 	}
 
 	select {
@@ -162,19 +206,29 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		utils.Debugf("[YDOCS] WebSocket connected to %s", info.Host)
 
 		writeQueue := make(chan []byte, t.GetConfig().MaxQueueSize)
+		priorityQueueSize := t.GetConfig().MaxQueueSize / 4
+		if priorityQueueSize < 64 {
+			priorityQueueSize = 64
+		}
+		priorityQueue := make(chan []byte, priorityQueueSize)
 		if existingSession != nil {
 			writeQueue = existingSession.WriteQueue
+			if existingSession.PriorityQueue != nil {
+				priorityQueue = existingSession.PriorityQueue
+			}
 		}
 
 		session := &DocSession{
-			Info:       info,
-			Conn:       conn,
-			WriteQueue: writeQueue,
-			UserID:     userID,
+			Info:          info,
+			Conn:          conn,
+			WriteQueue:    writeQueue,
+			PriorityQueue: priorityQueue,
+			UserID:        userID,
 		}
 
 		t.Mu.Lock()
 		t.session = session
+		t.peerBatch.Store(0)
 		t.SetConnected(true)
 		t.Mu.Unlock()
 
@@ -184,7 +238,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		// Auth - use safeWrite
 		auth1 := fmt.Sprintf(`40{"token":"%s"}`, info.Token)
-		session.safeWrite(websocket.TextMessage, []byte(auth1))
+		_ = session.safeWrite(websocket.TextMessage, []byte(auth1))
 
 		authData := map[string]interface{}{
 			"type": "auth", "docid": info.DocID, "token": "fghhfgsjdgfjs",
@@ -193,7 +247,13 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			"openCmd": info.OpenCmd, "coEditingMode": "fast", "jwtOpen": info.Token,
 		}
 		messagePart, _ := json.Marshal([]interface{}{"message", authData})
-		session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
+		_ = session.safeWrite(websocket.TextMessage, []byte(fmt.Sprintf("42%s", string(messagePart))))
+
+		// Backward-compatible capability probe. Old peers ignore this invalid
+		// base64 cursor payload; new peers answer by sending the same probe from
+		// their own session. Batching is enabled only after a peer probe is seen.
+		capabilityMsg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, yandexBatchCapability)
+		_ = session.safeWrite(websocket.TextMessage, []byte(capabilityMsg))
 
 		connectedAt := time.Now()
 		for t.IsRunning() {
@@ -201,6 +261,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			if err != nil {
 				utils.Debugf("[YDOCS] Read error: %v", err)
 				t.SetConnected(false)
+				t.peerBatch.Store(0)
 				// If the session was healthy for a while, treat the next
 				// connect as fresh (attempt -1 -> next attempt 0) so backoff
 				// doesn't keep growing across normal long-lived reconnects.
@@ -218,27 +279,125 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 func (t *YandexDocsTransport) writerLoop() {
 	for t.IsRunning() {
-		t.Mu.Lock()
+		t.Mu.RLock()
 		session := t.session
-		t.Mu.Unlock()
+		t.Mu.RUnlock()
 
 		if session == nil || session.Conn == nil {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 			continue
 		}
 
-		select {
-		case packet := <-session.WriteQueue:
-			payload := base64.StdEncoding.EncodeToString(packet)
-			msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+		first, ok := waitYandexPacket(session)
+		if !ok {
+			continue
+		}
 
-			if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
-				utils.Debugf("[YDOCS] Write error: %v", err)
+		packets := [][]byte{first}
+		if t.peerBatch.Load() == 1 {
+			// Opportunistic batching only: drain packets already waiting, but do
+			// not add a batching delay to an otherwise idle/interactive flow.
+			for len(packets) < yandexBatchMaxPackets {
+				packet, available := dequeueYandexPacket(session)
+				if !available {
+					break
+				}
+				packets = append(packets, packet)
 			}
-		default:
-			time.Sleep(10 * time.Millisecond)
+		}
+
+		wirePayload := packets[0]
+		if len(packets) > 1 {
+			wirePayload = encodeYandexBatch(packets)
+		}
+		payload := base64.StdEncoding.EncodeToString(wirePayload)
+		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+
+		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+			utils.Debugf("[YDOCS] Write error: %v", err)
+			t.SetConnected(false)
+			t.peerBatch.Store(0)
+			_ = session.Conn.Close() // wake reader so reconnect starts promptly
 		}
 	}
+}
+
+func dequeueYandexPacket(session *DocSession) ([]byte, bool) {
+	if session == nil {
+		return nil, false
+	}
+	if session.PriorityQueue != nil {
+		select {
+		case packet := <-session.PriorityQueue:
+			return packet, true
+		default:
+		}
+	}
+	select {
+	case packet := <-session.WriteQueue:
+		return packet, true
+	default:
+		return nil, false
+	}
+}
+
+func waitYandexPacket(session *DocSession) ([]byte, bool) {
+	if packet, ok := dequeueYandexPacket(session); ok {
+		return packet, true
+	}
+
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case packet := <-session.PriorityQueue:
+		return packet, true
+	case packet := <-session.WriteQueue:
+		return packet, true
+	case <-timer.C:
+		return nil, false
+	}
+}
+
+func encodeYandexBatch(packets [][]byte) []byte {
+	total := len(yandexBatchMagic)
+	for _, packet := range packets {
+		total += 4 + len(packet)
+	}
+	out := make([]byte, 0, total)
+	out = append(out, yandexBatchMagic[:]...)
+	var length [4]byte
+	for _, packet := range packets {
+		binary.BigEndian.PutUint32(length[:], uint32(len(packet)))
+		out = append(out, length[:]...)
+		out = append(out, packet...)
+	}
+	return out
+}
+
+func decodeYandexBatch(data []byte) ([][]byte, bool) {
+	if len(data) < len(yandexBatchMagic) || string(data[:len(yandexBatchMagic)]) != string(yandexBatchMagic[:]) {
+		return nil, false
+	}
+	pos := len(yandexBatchMagic)
+	packets := make([][]byte, 0, yandexBatchMaxPackets)
+	for pos < len(data) {
+		if pos+4 > len(data) {
+			return nil, false
+		}
+		n := int(binary.BigEndian.Uint32(data[pos : pos+4]))
+		pos += 4
+		if n <= 0 || pos+n > len(data) {
+			return nil, false
+		}
+		packet := make([]byte, n)
+		copy(packet, data[pos:pos+n])
+		packets = append(packets, packet)
+		pos += n
+		if len(packets) > 64 {
+			return nil, false
+		}
+	}
+	return packets, len(packets) > 0
 }
 
 func (t *YandexDocsTransport) keepAliveLoop() {
@@ -248,14 +407,15 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 
 	for t.IsRunning() {
 		<-ticker.C
-		t.Mu.Lock()
+		t.Mu.RLock()
 		session := t.session
-		t.Mu.Unlock()
+		t.Mu.RUnlock()
 
 		if session != nil && session.Conn != nil {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
 				t.SetConnected(false)
+				t.peerBatch.Store(0)
 			}
 		}
 	}
@@ -267,11 +427,15 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 	if strings.Contains(text, "---KA---") {
 		return
 	}
+	if strings.Contains(text, yandexBatchCapability) {
+		t.peerBatch.Store(1)
+		return
+	}
 
 	// Socket.IO ping - respond with pong (use safeWrite)
 	if text == "2" {
 		if session != nil && session.Conn != nil {
-			session.safeWrite(websocket.TextMessage, []byte("3"))
+			_ = session.safeWrite(websocket.TextMessage, []byte("3"))
 		}
 		return
 	}
@@ -288,6 +452,14 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		decoded, err := base64.StdEncoding.DecodeString(base64Str)
 		if err != nil {
 			utils.Debugf("[YDOCS] Base64 decode error: %v", err)
+			return
+		}
+
+		if packets, isBatch := decodeYandexBatch(decoded); isBatch {
+			for _, packet := range packets {
+				t.RecordReceive(len(packet))
+				t.CallReceive(packet)
+			}
 			return
 		}
 
