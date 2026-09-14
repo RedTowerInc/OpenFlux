@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -161,6 +162,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		}
 	}()
 	defer clientConn.Close()
+	setNoDelay(clientConn)
 
 	buf := make([]byte, 256)
 	n, err := clientConn.Read(buf)
@@ -214,6 +216,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	}
 	s.dialSuccess.Add(1)
 	defer targetConn.Close()
+	setNoDelay(targetConn)
 
 	if _, err := clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); err != nil {
 		s.setLast(targetAddr, "connect reply: "+err.Error())
@@ -225,27 +228,46 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		defer targetConn.Close()
 		n, copyErr := io.Copy(targetConn, clientConn)
 		if n > 0 {
 			s.bytesUp.Add(uint64(n))
 		}
-		if copyErr != nil {
+		// Preserve TCP half-close semantics. Closing the whole target socket as
+		// soon as the upload side reaches EOF can truncate a response that is
+		// still arriving in the opposite direction.
+		closeWrite(targetConn)
+		if !isExpectedClose(copyErr) {
 			s.setLast(targetAddr, "upload copy: "+copyErr.Error())
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		defer clientConn.Close()
 		n, copyErr := io.Copy(clientConn, targetConn)
 		if n > 0 {
 			s.bytesDown.Add(uint64(n))
 		}
-		if copyErr != nil {
+		closeWrite(clientConn)
+		if !isExpectedClose(copyErr) {
 			s.setLast(targetAddr, "download copy: "+copyErr.Error())
 		}
 	}()
 
 	wg.Wait()
+}
+
+func setNoDelay(conn net.Conn) {
+	if c, ok := conn.(interface{ SetNoDelay(bool) error }); ok {
+		_ = c.SetNoDelay(true)
+	}
+}
+
+func closeWrite(conn net.Conn) {
+	if c, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = c.CloseWrite()
+	}
+}
+
+func isExpectedClose(err error) bool {
+	return err == nil || errors.Is(err, net.ErrClosed)
 }
