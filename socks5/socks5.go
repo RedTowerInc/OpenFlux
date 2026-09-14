@@ -133,8 +133,11 @@ func (s *SOCKS5Server) setLast(target, errText string) {
 	s.statsMu.Lock()
 	if target != "" {
 		s.lastTarget = target
-	}
-	if errText != "" {
+		// A successful new CONNECT must clear a stale error from an older
+		// connection, otherwise the Android status screen keeps reporting a
+		// harmless historical "use of closed network connection" forever.
+		s.lastError = errText
+	} else if errText != "" {
 		s.lastError = errText
 	}
 	s.statsMu.Unlock()
