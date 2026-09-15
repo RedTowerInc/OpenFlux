@@ -7,8 +7,20 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"universal-bypass-tool/utils"
+)
+
+const (
+	// Browsers and mobile apps can leave many pooled SOCKS connections open.
+	// A global (both-directions) idle timeout keeps dead flows from accumulating
+	// without killing a one-way active video/download stream.
+	proxyIdleTimeout = 60 * time.Second
+
+	// Preserve a real TCP half-close briefly so a final HTTP/TLS response can
+	// drain, but never wait forever for the opposite direction to close.
+	halfCloseGrace = 5 * time.Second
 )
 
 type Dialer interface {
@@ -135,7 +147,7 @@ func (s *SOCKS5Server) setLast(target, errText string) {
 		s.lastTarget = target
 		// A successful new CONNECT must clear a stale error from an older
 		// connection, otherwise the Android status screen keeps reporting a
-		// harmless historical "use of closed network connection" forever.
+		// harmless historical error forever.
 		s.lastError = errText
 	} else if errText != "" {
 		s.lastError = errText
@@ -151,6 +163,27 @@ func (s *SOCKS5Server) handshakeError(stage string, err error) {
 	}
 	s.setLast("", text)
 	utils.Debugf("[SOCKS5] Handshake error: %s", text)
+}
+
+type copyResult struct {
+	direction string
+	dst       net.Conn
+	err       error
+}
+
+type activityWriter struct {
+	dst          net.Conn
+	counter      *atomic.Uint64
+	lastActivity *atomic.Int64
+}
+
+func (w *activityWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if n > 0 {
+		w.counter.Add(uint64(n))
+		w.lastActivity.Store(time.Now().UnixNano())
+	}
+	return n, err
 }
 
 func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
@@ -226,37 +259,69 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		return
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	results := make(chan copyResult, 2)
 
 	go func() {
-		defer wg.Done()
-		n, copyErr := io.Copy(targetConn, clientConn)
-		if n > 0 {
-			s.bytesUp.Add(uint64(n))
-		}
-		// Preserve TCP half-close semantics. Closing the whole target socket as
-		// soon as the upload side reaches EOF can truncate a response that is
-		// still arriving in the opposite direction.
-		closeWrite(targetConn)
-		if !isExpectedClose(copyErr) {
-			s.setLast(targetAddr, "upload copy: "+copyErr.Error())
-		}
+		_, copyErr := io.Copy(&activityWriter{dst: targetConn, counter: &s.bytesUp, lastActivity: &lastActivity}, clientConn)
+		results <- copyResult{direction: "upload", dst: targetConn, err: copyErr}
 	}()
 
 	go func() {
-		defer wg.Done()
-		n, copyErr := io.Copy(clientConn, targetConn)
-		if n > 0 {
-			s.bytesDown.Add(uint64(n))
-		}
-		closeWrite(clientConn)
-		if !isExpectedClose(copyErr) {
-			s.setLast(targetAddr, "download copy: "+copyErr.Error())
-		}
+		_, copyErr := io.Copy(&activityWriter{dst: clientConn, counter: &s.bytesDown, lastActivity: &lastActivity}, targetConn)
+		results <- copyResult{direction: "download", dst: clientConn, err: copyErr}
 	}()
 
-	wg.Wait()
+	idleTicker := time.NewTicker(5 * time.Second)
+	defer idleTicker.Stop()
+
+	var first copyResult
+	for {
+		select {
+		case first = <-results:
+			goto firstFinished
+		case <-idleTicker.C:
+			last := time.Unix(0, lastActivity.Load())
+			if time.Since(last) >= proxyIdleTimeout {
+				// Both directions have been quiet for a full minute. Close both
+				// sockets so pooled/dead app connections cannot grow without bound.
+				_ = clientConn.Close()
+				_ = targetConn.Close()
+				return
+			}
+		}
+	}
+
+firstFinished:
+	if !isExpectedClose(first.err) {
+		s.setLast(targetAddr, first.direction+" copy: "+first.err.Error())
+		_ = clientConn.Close()
+		_ = targetConn.Close()
+		select {
+		case <-results:
+		case <-time.After(time.Second):
+		}
+		return
+	}
+
+	// Let the opposite half drain a final response, but cap the grace period.
+	// The previous unlimited half-close was directly observable as hundreds of
+	// active SOCKS flows accumulating on Android.
+	closeWrite(first.dst)
+	select {
+	case second := <-results:
+		if !isExpectedClose(second.err) {
+			s.setLast(targetAddr, second.direction+" copy: "+second.err.Error())
+		}
+	case <-time.After(halfCloseGrace):
+		_ = clientConn.Close()
+		_ = targetConn.Close()
+		select {
+		case <-results:
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 func setNoDelay(conn net.Conn) {
