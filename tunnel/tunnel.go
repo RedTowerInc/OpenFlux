@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -17,6 +18,8 @@ import (
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/utils"
 )
+
+const tcpDialTimeout = 6 * time.Second
 
 type TCPTunnel struct {
 	gvisorStack *stack.Stack
@@ -69,7 +72,7 @@ func NewTCPTunnel(trans transport.Transport, isExitNode bool) *TCPTunnel {
 
 	tunnelEP := NewTunnelLinkEndpoint()
 	tunnelEP.onOutgoingPacket = func(data []byte) {
-		trans.Send(data)
+		_ = trans.Send(data)
 	}
 	t.tunnelEP = tunnelEP
 
@@ -104,7 +107,7 @@ func (t *TCPTunnel) setupExitNode(tunnelNIC tcpip.NICID) {
 
 	t.rawEP = rawEP
 	rawEP.SetTransportSender(func(data []byte) {
-		t.transport.Send(data)
+		_ = t.transport.Send(data)
 	})
 
 	internetNIC := tcpip.NICID(2)
@@ -173,13 +176,23 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 		nic = tcpip.NICID(2)
 	}
 
-	conn, err := gonet.DialTCP(t.gvisorStack, tcpip.FullAddress{
+	// gonet.DialTCP uses context.Background(), so a lost SYN can otherwise
+	// leave a SOCKS CONNECT goroutine blocked for a very long time. Mobile web
+	// pages fan out to many origins; those stuck connects accumulated into the
+	// hundreds in diagnostics and starved useful traffic. Use the context-aware
+	// gVisor dial API and fail fast enough for apps to try another endpoint.
+	ctx, cancel := context.WithTimeout(context.Background(), tcpDialTimeout)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, t.gvisorStack, tcpip.FullAddress{
 		NIC:  nic,
 		Addr: tcpip.AddrFrom4([4]byte{ip[0], ip[1], ip[2], ip[3]}),
 		Port: uint16(tcpAddr.Port),
 	}, ipv4.ProtocolNumber)
+	if err != nil {
+		return nil, fmt.Errorf("connect %s: %w", address, err)
+	}
 
-	return conn, err
+	return conn, nil
 }
 
 func (t *TCPTunnel) ListenTCP(port uint16) (net.Listener, error) {
