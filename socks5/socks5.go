@@ -200,43 +200,96 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 	setNoDelay(clientConn)
 
-	buf := make([]byte, 256)
-	n, err := clientConn.Read(buf)
-	if err != nil || n < 2 || buf[0] != 0x05 {
-		s.handshakeError(fmt.Sprintf("greeting n=%d", n), err)
+	// SOCKS5 is a byte stream; a single Read is not guaranteed to contain a
+	// complete greeting or CONNECT request. Parse each field with ReadFull so
+	// packetization by tun2socks cannot create intermittent handshake failures.
+	greeting := make([]byte, 2)
+	if _, err := io.ReadFull(clientConn, greeting); err != nil {
+		s.handshakeError("greeting header", err)
 		return
 	}
-
+	if greeting[0] != 0x05 || greeting[1] == 0 {
+		s.handshakeError(fmt.Sprintf("bad greeting ver=%d methods=%d", greeting[0], greeting[1]), nil)
+		return
+	}
+	methods := make([]byte, int(greeting[1]))
+	if _, err := io.ReadFull(clientConn, methods); err != nil {
+		s.handshakeError("greeting methods", err)
+		return
+	}
+	noAuth := false
+	for _, method := range methods {
+		if method == 0x00 {
+			noAuth = true
+			break
+		}
+	}
+	if !noAuth {
+		_, _ = clientConn.Write([]byte{0x05, 0xff})
+		s.handshakeError("no supported auth method", nil)
+		return
+	}
 	if _, err := clientConn.Write([]byte{0x05, 0x00}); err != nil {
 		s.handshakeError("greeting reply", err)
 		return
 	}
 
-	n, err = clientConn.Read(buf)
-	if err != nil || n < 10 || buf[0] != 0x05 || buf[1] != 0x01 {
-		s.handshakeError(fmt.Sprintf("request n=%d", n), err)
+	reqHeader := make([]byte, 4)
+	if _, err := io.ReadFull(clientConn, reqHeader); err != nil {
+		s.handshakeError("request header", err)
+		return
+	}
+	if reqHeader[0] != 0x05 || reqHeader[1] != 0x01 || reqHeader[2] != 0x00 {
+		s.handshakeError(fmt.Sprintf("bad request ver=%d cmd=%d rsv=%d", reqHeader[0], reqHeader[1], reqHeader[2]), nil)
 		return
 	}
 
-	var targetAddr string
-	switch buf[3] {
-	case 0x01:
-		targetAddr = fmt.Sprintf("%d.%d.%d.%d:%d",
-			buf[4], buf[5], buf[6], buf[7],
-			uint16(buf[8])<<8|uint16(buf[9]))
-	case 0x03:
-		domainLen := int(buf[4])
-		if domainLen == 0 || 5+domainLen+2 > n {
-			s.handshakeError(fmt.Sprintf("bad domain request len=%d n=%d", domainLen, n), nil)
+	var host string
+	switch reqHeader[3] {
+	case 0x01: // IPv4
+		addr := make([]byte, 4)
+		if _, err := io.ReadFull(clientConn, addr); err != nil {
+			s.handshakeError("ipv4 address", err)
 			return
 		}
-		targetAddr = fmt.Sprintf("%s:%d",
-			string(buf[5:5+domainLen]),
-			uint16(buf[5+domainLen])<<8|uint16(buf[6+domainLen]))
+		host = net.IP(addr).String()
+	case 0x03: // DOMAIN
+		var lenBuf [1]byte
+		if _, err := io.ReadFull(clientConn, lenBuf[:]); err != nil {
+			s.handshakeError("domain length", err)
+			return
+		}
+		domainLen := int(lenBuf[0])
+		if domainLen == 0 {
+			s.handshakeError("empty domain", nil)
+			return
+		}
+		domain := make([]byte, domainLen)
+		if _, err := io.ReadFull(clientConn, domain); err != nil {
+			s.handshakeError("domain", err)
+			return
+		}
+		host = string(domain)
+	case 0x04: // IPv6 is not carried by the current OpenFlux dataplane.
+		addr := make([]byte, 16)
+		port := make([]byte, 2)
+		_, _ = io.ReadFull(clientConn, addr)
+		_, _ = io.ReadFull(clientConn, port)
+		_, _ = clientConn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		s.handshakeError("IPv6 SOCKS target unsupported", nil)
+		return
 	default:
-		s.handshakeError(fmt.Sprintf("unsupported ATYP=%d", buf[3]), nil)
+		s.handshakeError(fmt.Sprintf("unsupported ATYP=%d", reqHeader[3]), nil)
 		return
 	}
+
+	portBytes := make([]byte, 2)
+	if _, err := io.ReadFull(clientConn, portBytes); err != nil {
+		s.handshakeError("target port", err)
+		return
+	}
+	port := uint16(portBytes[0])<<8 | uint16(portBytes[1])
+	targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 	s.connectRequests.Add(1)
 	s.setLast(targetAddr, "")
