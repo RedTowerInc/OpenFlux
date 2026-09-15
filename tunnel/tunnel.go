@@ -19,7 +19,7 @@ import (
 	"universal-bypass-tool/utils"
 )
 
-const tcpDialTimeout = 6 * time.Second
+const tcpDialTimeout = 15 * time.Second
 
 type TCPTunnel struct {
 	gvisorStack *stack.Stack
@@ -176,11 +176,9 @@ func (t *TCPTunnel) DialTCP(address string) (net.Conn, error) {
 		nic = tcpip.NICID(2)
 	}
 
-	// gonet.DialTCP uses context.Background(), so a lost SYN can otherwise
-	// leave a SOCKS CONNECT goroutine blocked for a very long time. Mobile web
-	// pages fan out to many origins; those stuck connects accumulated into the
-	// hundreds in diagnostics and starved useful traffic. Use the context-aware
-	// gVisor dial API and fail fast enough for apps to try another endpoint.
+	// Bound lost SYNs so failed endpoints cannot accumulate indefinitely. The
+	// Yandex relay has materially higher latency than a normal local TCP dial,
+	// so keep enough headroom for slow-but-valid HTTPS connections.
 	ctx, cancel := context.WithTimeout(context.Background(), tcpDialTimeout)
 	defer cancel()
 	conn, err := gonet.DialContextTCP(ctx, t.gvisorStack, tcpip.FullAddress{
